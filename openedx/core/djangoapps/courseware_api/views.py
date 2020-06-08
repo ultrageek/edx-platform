@@ -29,7 +29,7 @@ from openedx.core.lib.api.view_utils import DeveloperErrorViewMixin
 from openedx.features.content_type_gating.models import ContentTypeGatingConfig
 from openedx.features.course_duration_limits.access import generate_course_expired_message
 from openedx.features.discounts.utils import generate_offer_html
-from student.models import CourseEnrollment
+from student.models import CourseEnrollment, CourseEnrollmentCelebration
 from xmodule.modulestore.django import modulestore
 from xmodule.modulestore.search import path_to_location
 
@@ -48,6 +48,8 @@ class CoursewareMeta:
         )
         self.effective_user = self.overview.effective_user
         self.course_key = course_key
+        self.enrollment_object = CourseEnrollment.get_enrollment(self.effective_user, self.course_key,
+                                                                 select_related=['celebration'])
 
     def __getattr__(self, name):
         return getattr(self.overview, name)
@@ -90,8 +92,7 @@ class CoursewareMeta:
 
     @property
     def can_show_upgrade_sock(self):
-        enrollment = CourseEnrollment.get_enrollment(self.effective_user, self.course_key)
-        can_show = can_show_verified_upgrade(self.effective_user, enrollment)
+        can_show = can_show_verified_upgrade(self.effective_user, self.enrollment_object)
         return can_show
 
     @property
@@ -144,6 +145,15 @@ class CoursewareMeta:
         return {
             'enabled': is_feature_enabled(self.overview, self.effective_user),
             'visible': self.overview.edxnotes_visibility,
+        }
+
+    @property
+    def celebrations(self):
+        """
+        Returns a list of celebrations that should be performed.
+        """
+        return {
+            'first_section': CourseEnrollmentCelebration.should_celebrate_first_section(self.enrollment_object),
         }
 
 
@@ -338,3 +348,60 @@ class Resume(DeveloperErrorViewMixin, APIView):
             pass
 
         return Response(resp)
+
+
+class Celebration(DeveloperErrorViewMixin, APIView):
+    """
+    **Use Cases**
+
+        Marks a particular celebration as complete
+
+    **Example Requests**
+
+        POST /api/courseware/celebration/{course_key}
+
+    **Request Parameters**
+
+        Body consists of the following fields:
+
+            * first_section (bool): when a user finishes their first section of a course
+
+    **Returns**
+
+        * 200 on success with above fields.
+        * 400 if an invalid parameter was sent.
+        * 403 if a user who does not have permission to masquerade as
+          another user specifies a username other than their own.
+        * 404 if the course is not available or cannot be seen.
+    """
+
+    authentication_classes = (
+        JwtAuthentication,
+        SessionAuthenticationAllowInactiveUser,
+    )
+    permission_classes = (IsAuthenticated, )
+    http_method_names = ['post']
+
+    # TODO: confirm masquerading doesn't let you change celebrations for someone else
+    def post(self, request, course_key_string, *args, **kwargs):
+        """
+        Handle a POST request.
+        """
+        course_key = CourseKey.from_string(course_key_string)
+
+        first_section = request.data.pop('first_section')
+        if request.data:
+            return Response(status=400)  # there were parameters we didn't recognize
+
+        enrollment = CourseEnrollment.get_enrollment(request.user, course_key)
+        if not enrollment:
+            return Response(status=400)
+
+        defaults = {}
+        if first_section is not None:
+            defaults['celebrate_first_section'] = first_section
+
+        if defaults:
+            CourseEnrollmentCelebration.objects.update_or_create(enrollment=enrollment, defaults=defaults)
+
+        return Response(status=200)
